@@ -1,0 +1,29 @@
+[Unit]
+Description=LGTV Companion
+Wants=systemd-logind.service
+After=network.target systemd-logind.service
+
+[Service]
+Type=exec
+User=lgtv-companion
+Group=lgtv-companion
+RuntimeDirectory=lgtv-companion
+RuntimeDirectoryMode=0750
+StateDirectory=lgtv-companion
+StateDirectoryMode=0700
+UMask=0077
+ExecStart=/usr/local/bin/lgtv-companiond --group-socket --monitor-power --state-dir /var/lib/lgtv-companion/pairing
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET
+
+[Install]
+WantedBy=multi-user.target

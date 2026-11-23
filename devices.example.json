@@ -1,0 +1,31 @@
+{
+  "external_api": false,
+  "wake_timeout_seconds": 40,
+  "idle_blank_minutes": null,
+  "streaming": null,
+  "devices": [
+    {
+      "id": "Device1",
+      "name": "Office TV",
+      "ip": "192.0.2.10",
+      "transport": "wss",
+      "port": null,
+      "certificate": "office-tv.der",
+      "connection_mode": "off",
+      "macs": ["02:11:22:33:44:55"],
+      "source_ip": null,
+      "wake_mode": "automatic",
+      "netmask": null,
+      "host_power": {
+        "enabled": false,
+        "follow_display_power": false,
+        "blank_when_idle": false,
+        "mute_speakers": false,
+        "output": null,
+        "hdmi_input": null,
+        "wake_hdmi": null,
+        "power_off_on_unknown_shutdown": false
+      }
+    }
+  ]
+}

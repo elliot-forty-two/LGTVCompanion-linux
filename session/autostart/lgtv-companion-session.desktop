@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=LGTV Companion Session
+Comment=Report session display power and idle state to LGTV Companion
+Exec=/usr/local/bin/lgtv-companion-session
+TryExec=/usr/local/bin/lgtv-companion-session
+Terminal=false
+NoDisplay=true

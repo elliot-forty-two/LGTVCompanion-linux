@@ -1,0 +1,23 @@
+{
+  "id": "luna_request",
+  "type": "request",
+  "uri": "ssap://system.notifications/createAlert",
+  "payload": {
+    "message": " ",
+    "buttons": [
+      {
+        "label": "",
+        "onClick": "luna://com.webos.settingsservice/setSystemSettings",
+        "params": {"category": "other", "settings": {"gameMode": {"hdmi1": "on"}}}
+      }
+    ],
+    "onclose": {
+      "uri": "luna://com.webos.settingsservice/setSystemSettings",
+      "params": {"category": "other", "settings": {"gameMode": {"hdmi1": "on"}}}
+    },
+    "onfail": {
+      "uri": "luna://com.webos.settingsservice/setSystemSettings",
+      "params": {"category": "other", "settings": {"gameMode": {"hdmi1": "on"}}}
+    }
+  }
+}

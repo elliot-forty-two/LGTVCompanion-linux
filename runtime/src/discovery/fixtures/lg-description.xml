@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<root xmlns="urn:schemas-upnp-org:device-1-0">
+  <device>
+    <deviceType>urn:schemas-upnp-org:device:MediaRenderer:1</deviceType>
+    <friendlyName>Office TV &amp; HDMI</friendlyName>
+    <manufacturer>LG Electronics.</manufacturer>
+    <modelDescription>LG webOS TV</modelDescription>
+    <modelName>LG TV</modelName>
+    <modelNumber>OLED65</modelNumber>
+    <UDN>uuid:example</UDN>
+    <serviceList>
+      <service>
+        <serviceType>urn:lge-com:service:webos-second-screen:1</serviceType>
+      </service>
+    </serviceList>
+  </device>
+</root>
