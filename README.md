@@ -231,4 +231,4 @@ lgtvcli -streaming_disconnect steam client-42
 
 Omit both identifiers to use one default manual session. Configure either a log reader or hooks for the same provider so each session has a single reporting path. Steam Remote Play and remote desktop can report sessions through the explicit hooks shown above.
 
-For development status and features planned for later releases, see [Linux port future work](../Docs/Linux-future-work.md).
+For development status and features planned for later releases, see [Linux port future work](Linux-future-work.md).
