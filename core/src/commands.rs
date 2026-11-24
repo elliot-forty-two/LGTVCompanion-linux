@@ -4,8 +4,9 @@ use std::{collections::BTreeMap, sync::LazyLock};
 
 use serde::{Deserialize, Serialize};
 
-const SETTINGS_SOURCE: &str = include_str!("../../../Common/lg_api_commands.h");
-const BUTTONS_SOURCE: &str = include_str!("../../../Common/lg_api_buttons.h");
+// JSON payloads from LGTV Companion for Windows 5.7.0 (a37d054).
+const SETTINGS_SOURCE: &str = include_str!("lg-api-commands.json");
+const BUTTONS_SOURCE: &str = include_str!("lg-api-buttons.json");
 
 /// Windows execution paths. ServiceInternal commands were session reports, not public CLI.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -122,10 +123,5 @@ pub static BUTTONS: LazyLock<Vec<String>> = LazyLock::new(|| {
 });
 
 fn decode_catalog<T: serde::de::DeserializeOwned>(source: &str) -> T {
-    let source = source.trim();
-    let json = source
-        .strip_prefix("R\"(")
-        .and_then(|source| source.strip_suffix(")\""))
-        .expect("Windows catalog uses a C++ raw string literal");
-    serde_json::from_str(json).expect("Windows catalog contains valid JSON")
+    serde_json::from_str(source).expect("bundled Windows catalog contains valid JSON")
 }

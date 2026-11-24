@@ -9,29 +9,19 @@ use lgtv_companion_core::{
 };
 use serde_json::{Value, json};
 
-const CONSOLE: &str = include_str!("../../../LGTV Companion Console/Console.cpp");
-const SERVICE: &str = include_str!("../../../LGTV Companion Service/companion.cpp");
-const DOCS: &str = include_str!("../../../Docs/Commandline.md");
+// Extracted from Console.cpp, companion.cpp, and Docs/Commandline.md.
+// Both dispatch lists include the names handled by the sethdmi prefix branch.
+const CONSOLE_COMMANDS: &str = include_str!("fixtures/windows-console-commands.txt");
+const SERVICE_COMMANDS: &str = include_str!("fixtures/windows-service-commands.txt");
+const DOCUMENTED_COMMANDS: &str = include_str!("fixtures/windows-documented-commands.txt");
 
 #[test]
 fn covers_builtin_dispatch_in_both_windows_executables() {
-    for (source, mode) in [
-        (CONSOLE, WindowsMode::Console),
-        (SERVICE, WindowsMode::Service),
+    for (commands, mode) in [
+        (CONSOLE_COMMANDS, WindowsMode::Console),
+        (SERVICE_COMMANDS, WindowsMode::Service),
     ] {
-        let mut discovered = BTreeSet::new();
-        for (offset, matched) in source.match_indices("command == \"") {
-            if source[..offset].ends_with(|ch: char| ch.is_ascii_alphanumeric() || ch == '_') {
-                continue;
-            }
-            let after_comparison = &source[offset + matched.len()..];
-            let name = after_comparison.split_once('"').unwrap().0;
-            discovered.insert(name);
-        }
-        // Both executables implement the sethdmi[1–4] family with a prefix branch.
-        assert!(source.contains("command.find(\"sethdmi\") == 0"));
-        discovered.extend(["sethdmi", "sethdmi1", "sethdmi2", "sethdmi3", "sethdmi4"]);
-
+        let expected: BTreeSet<_> = commands.lines().collect();
         let registry: BTreeSet<_> = WINDOWS_BUILTINS
             .iter()
             .filter(|builtin| {
@@ -42,7 +32,7 @@ fn covers_builtin_dispatch_in_both_windows_executables() {
             })
             .flat_map(|builtin| builtin.names.iter().copied())
             .collect();
-        assert_eq!(discovered, registry);
+        assert_eq!(registry, expected);
     }
 }
 
@@ -56,18 +46,14 @@ fn covers_documented_command_names() {
         builtins.len(),
         builtins.iter().copied().collect::<BTreeSet<_>>().len()
     );
-    for syntax in DOCS.lines().filter_map(|line| line.strip_prefix("- *-")) {
-        let name: String = syntax
-            .chars()
-            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
-            .collect();
+    for name in DOCUMENTED_COMMANDS.lines() {
         if let Some(prefix) = name.strip_suffix('X') {
             for input in 1..=4 {
                 assert!(SETTINGS.contains_key(&format!("{prefix}{input}")));
             }
         } else {
             assert!(
-                builtins.contains(&&name.as_str()) || SETTINGS.contains_key(&name),
+                builtins.contains(&&name) || SETTINGS.contains_key(name),
                 "{name}"
             );
         }
@@ -174,18 +160,9 @@ fn windows_wake_packet_and_destination() {
 #[test]
 fn registration_frames_match_the_windows_pairing_manifest() {
     use lgtv_companion_core::webos::registration_frame;
-    let source = include_str!("../../../Common/lg_api.h");
-    for (prefix, key) in [
-        ("#define LG_HANDSHAKE_NOTPAIRED_V3", None),
-        ("#define LG_HANDSHAKE_PAIRED_V3", Some("#CLIENTKEY#")),
-    ] {
-        let literal = source
-            .lines()
-            .find(|line| line.starts_with(prefix))
-            .unwrap();
-        let escaped = literal.split_once("L\"").unwrap().1;
-        let decoded: String = serde_json::from_str(&format!("\"{escaped}")).unwrap();
-        let expected: Value = serde_json::from_str(&decoded).unwrap();
-        assert_eq!(registration_frame(key), expected);
-    }
+    // Decoded from the two LG_HANDSHAKE_*_V3 macros in Common/lg_api.h.
+    let expected: Value =
+        serde_json::from_str(include_str!("fixtures/windows-registration-frames.json")).unwrap();
+    assert_eq!(registration_frame(None), expected["unpaired"]);
+    assert_eq!(registration_frame(Some("#CLIENTKEY#")), expected["paired"]);
 }

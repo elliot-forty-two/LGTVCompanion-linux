@@ -113,12 +113,12 @@ The system unit runs as the dedicated `lgtv-companion` account. Members of the `
 Install the binaries, account definition and unit from the repository root.
 
 ```sh
-cargo build --release --locked --manifest-path linux/Cargo.toml
-sudo install -Dm0755 linux/target/release/lgtv-companiond /usr/local/bin/lgtv-companiond
-sudo install -Dm0755 linux/target/release/lgtvcli /usr/local/bin/lgtvcli
-sudo install -Dm0644 linux/systemd/lgtv-companion.conf /etc/sysusers.d/lgtv-companion.conf
+cargo build --release --locked
+sudo install -Dm0755 target/release/lgtv-companiond /usr/local/bin/lgtv-companiond
+sudo install -Dm0755 target/release/lgtvcli /usr/local/bin/lgtvcli
+sudo install -Dm0644 systemd/lgtv-companion.conf /etc/sysusers.d/lgtv-companion.conf
 sudo systemd-sysusers /etc/sysusers.d/lgtv-companion.conf
-sudo install -Dm0644 linux/systemd/lgtv-companion.service /etc/systemd/system/lgtv-companion.service
+sudo install -Dm0644 systemd/lgtv-companion.service /etc/systemd/system/lgtv-companion.service
 ```
 
 For the `Device1` example above, copy the existing configuration, certificate and pairing key into their service locations. Use your configured certificate filename. Resolve certificate paths within `/etc/lgtv-companion` so the service can read them.
@@ -173,9 +173,9 @@ These daemon commands accept the normal device selectors. Omit selectors to targ
 Install the updated daemon and the session agent from the same build.
 
 ```sh
-cargo build --release --locked --manifest-path linux/Cargo.toml
-sudo install -Dm0755 linux/target/release/lgtv-companiond /usr/local/bin/lgtv-companiond
-sudo install -Dm0755 linux/target/release/lgtv-companion-session /usr/local/bin/lgtv-companion-session
+cargo build --release --locked
+sudo install -Dm0755 target/release/lgtv-companiond /usr/local/bin/lgtv-companiond
+sudo install -Dm0755 target/release/lgtv-companion-session /usr/local/bin/lgtv-companion-session
 ```
 
 Set `"follow_display_power": true` inside the TV's `host_power` object to follow display power. Add an optional `"output": "HDMI-A-1"` to tie that TV to a particular connector. Use the exact name from the agent's diagnostics. Keep `hdmi_input` set to the host's TV input to protect TV apps and other sources.
@@ -198,7 +198,7 @@ On Wayland without a usable display-power interface, the related automatic actio
 For per-user autostart, install the provided desktop entry.
 
 ```sh
-install -Dm0644 linux/session/autostart/lgtv-companion-session.desktop \
+install -Dm0644 session/autostart/lgtv-companion-session.desktop \
   "${XDG_CONFIG_HOME:-$HOME/.config}/autostart/lgtv-companion-session.desktop"
 ```
 
