@@ -320,35 +320,128 @@ async fn wake(
         return time::timeout(deadline, attempt).await?;
     }
 
-    let source_ip = device.source_ip.unwrap_or(Ipv4Addr::UNSPECIFIED);
-    let socket = UdpSocket::bind(SocketAddrV4::new(source_ip, 0))
-        .await
-        .map_err(|error| format!("Cannot bind the Wake-on-LAN socket to {source_ip}: {error}"))?;
-    socket.set_broadcast(true)?;
+    let source = SocketAddrV4::new(device.source_ip.unwrap_or(Ipv4Addr::UNSPECIFIED), 0);
+    let mut last_network_error = None;
     let send_packets = async {
+        let socket = loop {
+            match UdpSocket::bind(source).await {
+                Ok(socket) => break socket,
+                Err(error) => {
+                    let detail = format!(
+                        "Cannot bind the Wake-on-LAN socket to {}: {error}",
+                        source.ip()
+                    );
+                    if !network_not_ready(&error) {
+                        return Err(detail.into());
+                    }
+                    last_network_error = Some(detail);
+                    time::sleep(wol::REPEAT_INTERVAL).await;
+                }
+            }
+        };
+        socket.set_broadcast(true)?;
         let mut interval = time::interval(wol::REPEAT_INTERVAL);
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            let mut sent = false;
-            for mac in &packets {
-                for ip in &destinations {
-                    sent |= socket
-                        .send_to(mac, SocketAddrV4::new(*ip, wol::PORT))
-                        .await
-                        .is_ok();
+            match send_wake_packets(&socket, &destinations, &packets).await {
+                Ok(()) => last_network_error = None,
+                Err(error) => {
+                    let detail = format!("Could not send a Wake-on-LAN packet: {error}");
+                    if !network_not_ready(&error) {
+                        return Err(detail.into());
+                    }
+                    last_network_error = Some(detail);
                 }
-            }
-            if !sent {
-                return Err("Could not send a Wake-on-LAN packet".into());
             }
         }
     };
-    time::timeout(deadline, async {
+    match time::timeout(deadline, async {
         tokio::select! {
             result = attempt => result,
             result = send_packets => result,
         }
     })
-    .await?
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => match last_network_error {
+            Some(detail) => Err(format!("{detail} before the wake timeout").into()),
+            None => Err(error.into()),
+        },
+    }
+}
+
+fn network_not_ready(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::AddrNotAvailable
+            | io::ErrorKind::NetworkDown
+            | io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::HostUnreachable
+    )
+}
+
+async fn send_wake_packets(
+    socket: &UdpSocket,
+    destinations: &[Ipv4Addr],
+    packets: &[[u8; 102]],
+) -> io::Result<()> {
+    let mut sent = false;
+    let mut failure = None;
+    for packet in packets {
+        for ip in destinations {
+            match socket
+                .send_to(packet, SocketAddrV4::new(*ip, wol::PORT))
+                .await
+            {
+                Ok(_) => sent = true,
+                Err(error) if failure.is_none() || network_not_ready(&error) => {
+                    failure = Some(error);
+                }
+                Err(_) => {}
+            }
+        }
+    }
+    if sent {
+        Ok(())
+    } else {
+        Err(failure.unwrap_or_else(|| io::Error::other("No Wake-on-LAN destination")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn wake_waits_for_an_unavailable_source_address_until_its_deadline() {
+        let device: Device = serde_json::from_value(json!({
+            "id": "Device1",
+            "ip": "192.0.2.250",
+            "source_ip": "192.0.2.251",
+            "macs": ["02:11:22:33:44:55"],
+            "transport": "ws"
+        }))
+        .unwrap();
+        let operation = wake(&device, None, "mock-key", 1, None);
+        tokio::pin!(operation);
+        assert!(
+            time::timeout(Duration::from_millis(100), &mut operation)
+                .await
+                .is_err()
+        );
+        let error = match time::timeout(Duration::from_secs(2), operation)
+            .await
+            .unwrap()
+        {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("wake succeeded without an available source address"),
+        };
+        assert!(
+            error.contains("Cannot bind the Wake-on-LAN socket"),
+            "{error}"
+        );
+        assert!(error.contains("before the wake timeout"), "{error}");
+    }
 }

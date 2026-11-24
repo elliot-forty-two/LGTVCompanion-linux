@@ -19,6 +19,8 @@
       "host_power": {
         "enabled": false,
         "follow_display_power": false,
+        "wake_on_resume": false,
+        "wake_on_boot": false,
         "blank_when_idle": false,
         "mute_speakers": false,
         "output": null,

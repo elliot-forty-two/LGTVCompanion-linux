@@ -13,6 +13,7 @@ pub enum DisplayPower {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Effect {
     Wake,
+    ResumeWake,
     PowerOff,
     Cancel,
 }
@@ -51,7 +52,7 @@ impl DisplayPolicy {
         };
         if power == DisplayPower::On && self.awaiting_display_on {
             self.awaiting_display_on = false;
-            return Some(Effect::Wake);
+            return Some(Effect::ResumeWake);
         }
 
         if !same_session || power == DisplayPower::Unknown {
@@ -91,7 +92,7 @@ mod tests {
         policy.reset(true);
         assert_eq!(policy.observe("a".into(), Off), None);
         assert_eq!(policy.observe("a".into(), Unknown), Some(Effect::Cancel));
-        assert_eq!(policy.observe("a".into(), On), Some(Effect::Wake));
+        assert_eq!(policy.observe("a".into(), On), Some(Effect::ResumeWake));
         assert_eq!(policy.observe("a".into(), On), None);
     }
 }

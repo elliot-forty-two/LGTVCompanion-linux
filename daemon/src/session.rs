@@ -213,6 +213,7 @@ impl DisplayAutomation {
                 if config.follow_display_power && daemon.automation_enabled(index) {
                     let action = match display_action {
                         Some(Effect::Wake) => Some(Action::Wake),
+                        Some(Effect::ResumeWake) if !config.wake_on_resume => Some(Action::Wake),
                         Some(Effect::PowerOff) => Some(Action::HostPowerOff),
                         _ => None,
                     };

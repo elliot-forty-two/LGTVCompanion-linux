@@ -98,6 +98,10 @@ pub struct HostPower {
     pub mute_speakers: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub follow_display_power: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wake_on_resume: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wake_on_boot: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hdmi_input: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

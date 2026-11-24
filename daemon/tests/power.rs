@@ -524,6 +524,122 @@ async fn lifecycle_powers_off_only_eligible_tvs_and_releases_the_inhibitor() {
     );
 }
 
+#[tokio::test]
+async fn host_resume_wakes_the_tv_without_a_session_agent() {
+    let (_bus, address) = start_bus().await;
+    let (inhibitors, mut locks) = mpsc::unbounded_channel();
+    let mock = Builder::address(address.as_str())
+        .unwrap()
+        .name(NAME)
+        .unwrap()
+        .serve_at(PATH, MockLogind { inhibitors })
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    let tv = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    fs::write(
+        dir.join("devices.json"),
+        json!({
+            "devices": [{"id": "Device1", "ip": "127.0.0.1",
+                "port": tv.local_addr().unwrap().port(), "transport": "ws",
+                "host_power": {"wake_on_resume": true}}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    Store::open(dir.join("pairing"))
+        .unwrap()
+        .save("Device1", "mock-key")
+        .unwrap();
+
+    let (_daemon, mut logs) = start_daemon(dir, &address);
+    let lock = armed(&mut locks, &mut logs).await;
+    sleep_signal(&mock, true).await;
+    let mut off = accept_tv(&tv).await;
+    answer(
+        &mut off,
+        "ssap://com.webos.service.tvpower/power/getPowerState",
+        json!({"state": "Standby"}),
+    )
+    .await;
+    released(lock).await;
+
+    sleep_signal(&mock, false).await;
+    sleep_signal(&mock, false).await;
+    let mut wake = accept_tv(&tv).await;
+    answer(
+        &mut wake,
+        "ssap://com.webos.service.tvpower/power/getPowerState",
+        json!({"state": "Active"}),
+    )
+    .await;
+    let _lock = armed(&mut locks, &mut logs).await;
+    assert!(
+        timeout(Duration::from_millis(70), tv.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn boot_wake_is_attempted_once_across_daemon_restarts() {
+    let (_bus, address) = start_bus().await;
+    let (inhibitors, mut locks) = mpsc::unbounded_channel();
+    let _mock = Builder::address(address.as_str())
+        .unwrap()
+        .name(NAME)
+        .unwrap()
+        .serve_at(PATH, MockLogind { inhibitors })
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    let tv = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    fs::write(
+        dir.join("devices.json"),
+        json!({
+            "devices": [{"id": "Device1", "ip": "127.0.0.1",
+                "port": tv.local_addr().unwrap().port(), "transport": "ws",
+                "host_power": {"wake_on_boot": true}}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let state = dir.join("pairing");
+    Store::open(state.clone())
+        .unwrap()
+        .save("Device1", "mock-key")
+        .unwrap();
+    fs::write(state.join(".last-boot-wake"), "previous boot").unwrap();
+
+    let (mut daemon, mut logs) = start_daemon(dir, &address);
+    let lock = armed(&mut locks, &mut logs).await;
+    let mut wake = accept_tv(&tv).await;
+    answer(
+        &mut wake,
+        "ssap://com.webos.service.tvpower/power/getPowerState",
+        json!({"state": "Active"}),
+    )
+    .await;
+    daemon.kill().await.unwrap();
+    released(lock).await;
+
+    let (_daemon, mut logs) = start_daemon(dir, &address);
+    let _lock = armed(&mut locks, &mut logs).await;
+    assert!(
+        timeout(Duration::from_millis(70), tv.accept())
+            .await
+            .is_err()
+    );
+}
+
 async fn armed(
     locks: &mut mpsc::UnboundedReceiver<UnixStream>,
     logs: &mut Lines<BufReader<ChildStderr>>,

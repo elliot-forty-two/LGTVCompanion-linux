@@ -83,11 +83,10 @@ async fn run() -> Result<()> {
         Config::load(&config_path)
             .map_err(|error| format!("Cannot load {}: {error}", config_path.display()))?,
     );
-    let store = Arc::new(Store::open(
-        state_path
-            .or_else(default_state_dir)
-            .ok_or("Specify a state directory with --state-dir")?,
-    )?);
+    let state_path = state_path
+        .or_else(default_state_dir)
+        .ok_or("Specify a state directory with --state-dir")?;
+    let store = Arc::new(Store::open(state_path.clone())?);
     let mut terminate = signal(SignalKind::terminate())?;
     let mut interrupt = signal(SignalKind::interrupt())?;
     let socket = CommandSocket::bind(socket_path.clone(), group_socket).await?;
@@ -98,6 +97,7 @@ async fn run() -> Result<()> {
     eprintln!("lgtv-companiond listening on {}", socket_path.display());
     if monitor_power {
         tokio::spawn(power::monitor(Arc::clone(&state)));
+        tokio::spawn(power::wake_at_boot(Arc::clone(&state), state_path));
     }
 
     loop {

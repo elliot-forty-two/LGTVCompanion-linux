@@ -2,7 +2,11 @@
 
 use std::{
     collections::HashMap,
+    fs,
     future::{Future, pending},
+    io::{Read, Seek, Write},
+    os::unix::fs::OpenOptionsExt,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
     time::Duration,
@@ -16,8 +20,10 @@ use zbus::{
     zvariant::{OwnedFd, OwnedValue},
 };
 
-use crate::Daemon;
-use lgtv_companion_runtime::{ipc::HostEvent, tv::Result};
+use crate::{Daemon, JOB_TIMEOUT};
+use lgtv_companion_runtime::{
+    batch::Action, config::HostPower, control::failed, ipc::HostEvent, tv::Result,
+};
 
 const SERVICE: &str = "org.freedesktop.login1";
 const PATH: &str = "/org/freedesktop/login1";
@@ -126,7 +132,11 @@ async fn subscribe(daemon: &Arc<Daemon>) -> Result<()> {
                     daemon.events.publish(event);
                 }
                 if event.is_end() {
-                    work = None;
+                    work = (event == Event::Resume && !state.in_progress()).then(|| {
+                        let daemon = Arc::clone(daemon);
+                        Box::pin(async move { wake(&daemon, WakeTrigger::Resume).await })
+                            as PowerWork
+                    });
                     retry.reset_immediately();
                 } else {
                     let unknown = event == Event::UnknownShutdown;
@@ -159,6 +169,107 @@ async fn subscribe(daemon: &Arc<Daemon>) -> Result<()> {
         }
     }
     Err("logind signal stream closed".into())
+}
+
+#[derive(Clone, Copy)]
+enum WakeTrigger {
+    Boot,
+    Resume,
+}
+
+impl WakeTrigger {
+    fn enabled(self, policy: &HostPower) -> bool {
+        match self {
+            Self::Boot => policy.wake_on_boot,
+            Self::Resume => policy.wake_on_resume,
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Boot => "host boot",
+            Self::Resume => "host resume",
+        }
+    }
+
+    fn targets(self, daemon: &Daemon) -> impl Iterator<Item = usize> {
+        daemon
+            .config
+            .devices
+            .iter()
+            .enumerate()
+            .filter(move |(index, device)| {
+                device
+                    .host_power
+                    .as_ref()
+                    .is_some_and(|policy| self.enabled(policy))
+                    && daemon.automation_enabled(*index)
+            })
+            .map(|(index, _)| index)
+    }
+}
+
+pub async fn wake_at_boot(daemon: Arc<Daemon>, state_path: PathBuf) {
+    let trigger = WakeTrigger::Boot;
+    if trigger.targets(&daemon).next().is_none() {
+        return;
+    }
+    match claim_boot_wake(&state_path) {
+        Ok(true) => wake(&daemon, trigger).await,
+        Ok(false) => {}
+        Err(error) => eprintln!("Could not record automatic boot wake: {error}"),
+    }
+}
+
+fn claim_boot_wake(state_path: &Path) -> Result<bool> {
+    let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+    let mut marker = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(state_path.join(".last-boot-wake"))?;
+    marker.lock()?;
+    let mut last_boot = String::new();
+    marker.read_to_string(&mut last_boot)?;
+    if last_boot == boot_id {
+        return Ok(false);
+    }
+    marker.rewind()?;
+    marker.write_all(boot_id.as_bytes())?;
+    marker.set_len(boot_id.len() as u64)?;
+    marker.sync_all()?;
+    Ok(true)
+}
+
+async fn wake(daemon: &Arc<Daemon>, trigger: WakeTrigger) {
+    let deadline = tokio::time::Instant::now() + JOB_TIMEOUT;
+    futures_util::future::join_all(trigger.targets(daemon).map(|index| async move {
+        let id = &daemon.config.devices[index].id;
+        let reason = trigger.description();
+        eprintln!("{id}: waking TV after {reason}");
+        let result = match daemon.start_automation(index, Action::Wake, None, deadline, true) {
+            Ok(work) => work.await,
+            Err(value) => value,
+        };
+        if failed(&result) {
+            let detail = result["error"]
+                .as_str()
+                .unwrap_or("TV rejected the wake request");
+            let detail: String = detail
+                .chars()
+                .take(240)
+                .flat_map(char::escape_debug)
+                .collect();
+            eprintln!("{id}: automatic wake after {reason} failed: {detail}");
+        } else if let Some(info) = result["info"].as_str() {
+            eprintln!("{id}: {info}");
+        } else if result["payload"]["state"] == "Active" {
+            eprintln!("{id}: TV is active");
+        }
+    }))
+    .await;
 }
 
 struct DelayInhibitor {

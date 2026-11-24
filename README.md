@@ -157,7 +157,21 @@ Add a `host_power` object to each TV you want the system service to manage. Exis
 
 The service powers off an enabled TV during suspend, hibernation, power-off or halt if the TV reports that it is active or screen-off. With `hdmi_input` set, it also requires the TV to confirm that HDMI input is in the foreground. Omit the input to act on any source. Reboot, kexec and soft reboot preserve the TV's power state. Set `power_off_on_unknown_shutdown` to `true` only if you want legacy logind shutdown signals to power off that TV even when the host cannot distinguish a shutdown from a reboot.
 
-Restart the service after editing `/etc/lgtv-companion/devices.json`. If at least one TV has a `host_power` policy, the daemon acquires a logind delay inhibitor so temporary overrides can take effect. It skips automatic TV commands if it cannot get a delay lock. It gives all eligible TVs at most four seconds in parallel, or less when logind's limit requires it, then releases the inhibitor. A TV worker that is busy with an explicit command can run out of time before the automatic command starts. Resume and cancellation discard unfinished lifecycle work and rearm the inhibitor. The session agent supplies the display-on signal that drives wake after resume. [logind delay inhibitor behavior](https://www.freedesktop.org/software/systemd/man/latest/org.freedesktop.login1.html)
+Restart the service after editing `/etc/lgtv-companion/devices.json`. If at least one TV has a `host_power` policy, the daemon acquires a logind delay inhibitor so temporary overrides can take effect. Automatic TV power-off requires a delay lock. It gives all eligible TVs at most four seconds in parallel, or less when logind's limit requires it, then releases the inhibitor. A TV worker that is busy with an explicit command can run out of time before the automatic command starts. Resume and cancellation discard unfinished lifecycle work and rearm the inhibitor. [logind delay inhibitor behavior](https://www.freedesktop.org/software/systemd/man/latest/org.freedesktop.login1.html)
+
+### Automatic TV wake from the daemon
+
+Set `"wake_on_resume": true` in the TV's `host_power` object to wake it when logind reports the end of sleep preparation. This includes unattended resumes. Set `"wake_on_boot": true` to attempt a wake the first time the daemon starts with that option enabled in a given host boot. The daemon tracks the boot in its state directory to avoid repeating the attempt on service restarts.
+
+```json
+"host_power": {
+  "hdmi_input": 1,
+  "wake_on_resume": true,
+  "wake_on_boot": true
+}
+```
+
+Both settings default to false and use the existing Wake-on-LAN configuration. They require `--monitor-power`, which the supplied systemd service already enables. The desktop session agent is optional for this setup. Restart the service after editing the configuration.
 
 ### Temporary automation overrides
 
@@ -180,7 +194,7 @@ sudo install -Dm0755 target/release/lgtv-companion-session /usr/local/bin/lgtv-c
 
 Set `"follow_display_power": true` inside the TV's `host_power` object to follow display power. Add an optional `"output": "HDMI-A-1"` to tie that TV to a particular connector. Use the exact name from the agent's diagnostics. Keep `hdmi_input` set to the host's TV input to protect TV apps and other sources.
 
-To select HDMI after an automatic wake, add `"wake_hdmi": {"input": 2, "delay_seconds": 1}` inside `host_power`. Use inputs 1–4 and a delay of 0–30 seconds, which defaults to one second. The delay begins once the TV reports it is active. The switch applies to display-driven wakes and restores after streaming power-off. Manual wakes, idle restores, and restoration after streaming blanking preserve the TV's current input. A newer effective display-power change, session handoff, host power event, or temporary automation disable cancels the pending switch. The existing `hdmi_input` setting guards automatic off and blanking independently.
+To select HDMI after an automatic wake, add `"wake_hdmi": {"input": 2, "delay_seconds": 1}` inside `host_power`. Use inputs 1–4 and a delay of 0–30 seconds, which defaults to one second. The delay begins once the TV reports it is active. The switch applies to boot, resume, and display-driven wakes, and to restores after streaming power-off. Manual wakes, idle restores, and restoration after streaming blanking preserve the TV's current input. A newer effective display-power change, session handoff, host power event, or temporary automation disable cancels the pending switch. The existing `hdmi_input` setting guards automatic off and blanking independently.
 
 For idle blanking, set `"idle_blank_minutes": 10` at the top level of the configuration (range 1–240) and `"blank_when_idle": true` in each participating TV's `host_power` object. Once the session crosses the idle threshold while the chosen display is on, the daemon blanks the TV's panel and restores it on activity if the TV acknowledged the blanking command. Set `"mute_speakers": true` to mute on idle or streaming blank and unmute when idle blanking is restored. The TV stays powered during idle blanking.
 
@@ -191,7 +205,7 @@ lgtv-companion-session --diagnose
 lgtv-companion-session
 ```
 
-The agent reports snapshots every two seconds. The daemon accepts reports from the active local graphical session on `seat0`. The first snapshot at startup or session handoff establishes a baseline. After that, a display-off transition or removal of a mapped connector powers off a TV that follows display power. An on transition wakes it. After host resume, the daemon waits for confirmed display-on. Missing display or topology evidence suspends the corresponding action. Diagnostics report the active connector names, aggregate display power and per-output power where available. [X.Org DPMS protocol](https://xorg.freedesktop.org/releases/current/doc/xextproto/dpms.html) · [logind session properties](https://www.freedesktop.org/software/systemd/man/latest/org.freedesktop.login1.html)
+The agent reports snapshots every two seconds. The daemon accepts reports from the active local graphical session on `seat0`. The first snapshot at startup or session handoff establishes a baseline. After that, a display-off transition or removal of a mapped connector powers off a TV that follows display power. An on transition wakes it. After host resume, display-following TVs wake on confirmed display-on unless `wake_on_resume` already handles that wake. Missing display or topology evidence suspends display-driven actions. Diagnostics report the active connector names, aggregate display power and per-output power where available. [X.Org DPMS protocol](https://xorg.freedesktop.org/releases/current/doc/xextproto/dpms.html) · [logind session properties](https://www.freedesktop.org/software/systemd/man/latest/org.freedesktop.login1.html)
 
 On Wayland without a usable display-power interface, the related automatic action remains suspended. Run `lgtv-companion-session --diagnose` to inspect the capabilities available in your session.
 

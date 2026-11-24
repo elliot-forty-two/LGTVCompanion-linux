@@ -1,5 +1,5 @@
 use std::{
-    fmt,
+    fmt, io,
     net::{Ipv4Addr, SocketAddrV4},
     sync::Arc,
     time::Duration,
@@ -141,7 +141,10 @@ impl Tv {
             socket
                 .bind(SocketAddrV4::new(source_ip, 0).into())
                 .map_err(|error| {
-                    format!("Cannot bind the TV connection to source_ip {source_ip}: {error}")
+                    io::Error::new(
+                        error.kind(),
+                        format!("Cannot bind the TV connection to source_ip {source_ip}: {error}"),
+                    )
                 })?;
         }
         let stream = timeout(REQUEST_TIMEOUT, socket.connect(address.into())).await??;
