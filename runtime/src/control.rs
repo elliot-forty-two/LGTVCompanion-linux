@@ -19,6 +19,7 @@ use tokio::{
     net::UdpSocket,
     time::{self, MissedTickBehavior},
 };
+use tokio_tungstenite::tungstenite::{Error as WebSocketError, error::ProtocolError};
 
 use crate::{
     batch::Action,
@@ -41,6 +42,14 @@ pub fn failed(result: &Value) -> bool {
         || result["payload"]["returnValue"] == false
 }
 
+pub enum ActionProgress {
+    IdleBlanked(bool),
+    StreamPower {
+        before: TvPower,
+        confirmed_off: bool,
+    },
+}
+
 pub async fn pair(device: &Device, store: &Store, on_prompt: impl FnOnce()) -> Result<Value> {
     let _lock = store.lock_pairing(&device.id)?;
     let mut tv = Tv::connect(device.address(), device.source_ip, device.certificate()?).await?;
@@ -61,7 +70,7 @@ pub async fn execute(
     wake_seconds: u64,
 ) -> Result<Value> {
     Connection::new(crate::config::ConnectionMode::Off)
-        .execute(device, store, action, wake_seconds, |_, _| {})
+        .execute(device, store, action, wake_seconds, |_| {})
         .await
 }
 
@@ -70,7 +79,7 @@ async fn run_action(
     device: &Device,
     certificate: Option<&[u8]>,
     action: &Action,
-    capture: impl FnMut(TvPower, bool) + Send,
+    progress: impl FnMut(ActionProgress) + Send,
 ) -> Result<Value> {
     match action {
         Action::Ssap(request) => tv.request(request.clone()).await.map(ssap_output),
@@ -109,7 +118,7 @@ async fn run_action(
                 .host_power
                 .as_ref()
                 .ok_or("Host power automation is disabled")?;
-            automatic_display_change(tv, policy, action, capture).await
+            automatic_display_change(tv, policy, action, progress).await
         }
         Action::SetAutomation(_) => {
             Err("Automatic management requires the Companion daemon".into())
@@ -122,7 +131,7 @@ async fn automatic_display_change(
     tv: &mut Tv,
     policy: &HostPower,
     action: &Action,
-    mut capture: impl FnMut(TvPower, bool),
+    mut progress: impl FnMut(ActionProgress),
 ) -> Result<Value> {
     let power = connection::query_power(tv).await?;
     if failed(&power) {
@@ -133,7 +142,10 @@ async fn automatic_display_change(
         .ok_or("TV returned no power state")?;
     let before = tv_power(state);
     if matches!(action, Action::StreamPowerOff) {
-        capture(before, false);
+        progress(ActionProgress::StreamPower {
+            before,
+            confirmed_off: false,
+        });
     }
     let (endpoint, accepted) = match action {
         Action::HostPowerOff | Action::StreamPowerOff
@@ -174,6 +186,11 @@ async fn automatic_display_change(
     if failed(&reply) {
         Err("TV rejected the automatic display request".into())
     } else {
+        match action {
+            Action::IdleBlank => progress(ActionProgress::IdleBlanked(true)),
+            Action::IdleRestore => progress(ActionProgress::IdleBlanked(false)),
+            _ => {}
+        }
         if policy.mute_speakers
             && matches!(
                 action,
@@ -207,7 +224,10 @@ async fn automatic_display_change(
                 .as_str()
                 .is_some_and(|state| tv_power(state) == TvPower::Standby)
         {
-            capture(before, true);
+            progress(ActionProgress::StreamPower {
+                before,
+                confirmed_off: true,
+            });
         }
         Ok(json!({"info": accepted, "applied": true}))
     }
@@ -274,7 +294,7 @@ async fn wake(
                 Some(tv) => tv,
                 None => match connection::register(device, &certificate, key).await {
                     Ok(tv) => tv,
-                    Err(error) if error.is::<io::Error>() || error.is::<time::error::Elapsed>() => {
+                    Err(error) if retryable_wake_connection(&*error) => {
                         time::sleep(wol::REPEAT_INTERVAL).await;
                         continue;
                     }
@@ -370,6 +390,26 @@ async fn wake(
             None => Err(error.into()),
         },
     }
+}
+
+fn retryable_wake_connection(error: &(dyn std::error::Error + 'static)) -> bool {
+    error.is::<io::Error>()
+        || error.is::<time::error::Elapsed>()
+        || match error.downcast_ref::<WebSocketError>() {
+            Some(WebSocketError::Protocol(ProtocolError::HandshakeIncomplete)) => true,
+            Some(WebSocketError::Io(error)) => {
+                network_not_ready(error)
+                    || matches!(
+                        error.kind(),
+                        io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::ConnectionAborted
+                            | io::ErrorKind::BrokenPipe
+                            | io::ErrorKind::UnexpectedEof
+                            | io::ErrorKind::TimedOut
+                    )
+            }
+            _ => false,
+        }
 }
 
 fn network_not_ready(error: &io::Error) -> bool {

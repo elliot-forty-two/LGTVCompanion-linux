@@ -1,10 +1,10 @@
 //! Host lifecycle observations from the logind manager on the system bus.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     fs,
     future::{Future, pending},
-    io::{Read, Seek, Write},
+    io::{self, Write},
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     pin::Pin,
@@ -22,7 +22,11 @@ use zbus::{
 
 use crate::{Daemon, JOB_TIMEOUT};
 use lgtv_companion_runtime::{
-    batch::Action, config::HostPower, control::failed, ipc::HostEvent, tv::Result,
+    batch::Action,
+    config::{Device, HostPower},
+    control::failed,
+    ipc::HostEvent,
+    tv::Result,
 };
 
 const SERVICE: &str = "org.freedesktop.login1";
@@ -68,6 +72,7 @@ async fn subscribe(daemon: &Arc<Daemon>) -> Result<()> {
     eprintln!("Monitoring host power events through logind");
     let mut state = PowerState::default();
     let mut owner = None::<String>;
+    let mut observed_owner_change = false;
     let mut inhibitor: Option<DelayInhibitor> = None;
     let mut work: Option<PowerWork> = None;
     let automation = daemon.has_power_automation();
@@ -78,12 +83,13 @@ async fn subscribe(daemon: &Arc<Daemon>) -> Result<()> {
             biased;
             changed = owners.next() => {
                 let Some(owner_change) = changed else { break };
+                observed_owner_change = true;
                 let next_owner = owner_change.map(|name| name.to_string());
                 if next_owner != owner {
                     owner = next_owner;
-                    state = PowerState::default();
                     inhibitor = None;
                     work = None;
+                    state.reset_for_owner_change(daemon);
                     retry.reset_immediately();
                 }
                 continue;
@@ -117,10 +123,15 @@ async fn subscribe(daemon: &Arc<Daemon>) -> Result<()> {
         if let Some(sender) = message.header().sender()
             && owner.as_deref() != Some(sender.as_str())
         {
+            // The owner stream is polled first. Ignore any queued signals from
+            // a previous owner once it has reported an ownership change.
+            if observed_owner_change {
+                continue;
+            }
             owner = Some(sender.to_string());
-            state = PowerState::default();
             inhibitor = None;
             work = None;
+            state.reset_for_owner_change(daemon);
             retry.reset_immediately();
         }
         match state.observe(&message) {
@@ -134,8 +145,10 @@ async fn subscribe(daemon: &Arc<Daemon>) -> Result<()> {
                 if event.is_end() {
                     work = (event == Event::Resume && !state.in_progress()).then(|| {
                         let daemon = Arc::clone(daemon);
-                        Box::pin(async move { wake(&daemon, WakeTrigger::Resume).await })
-                            as PowerWork
+                        Box::pin(async move {
+                            let trigger = WakeTrigger::Resume;
+                            wake(&daemon, trigger, trigger.targets(&daemon)).await;
+                        }) as PowerWork
                     });
                     retry.reset_immediately();
                 } else {
@@ -211,41 +224,62 @@ impl WakeTrigger {
 
 pub async fn wake_at_boot(daemon: Arc<Daemon>, state_path: PathBuf) {
     let trigger = WakeTrigger::Boot;
-    if trigger.targets(&daemon).next().is_none() {
+    let targets: Vec<_> = trigger.targets(&daemon).collect();
+    if targets.is_empty() {
         return;
     }
-    match claim_boot_wake(&state_path) {
-        Ok(true) => wake(&daemon, trigger).await,
-        Ok(false) => {}
+    match claim_boot_wakes(&state_path, &daemon.config.devices, targets) {
+        Ok(claimed) => wake(&daemon, trigger, claimed.into_iter()).await,
         Err(error) => eprintln!("Could not record automatic boot wake: {error}"),
     }
 }
 
-fn claim_boot_wake(state_path: &Path) -> Result<bool> {
+fn claim_boot_wakes(
+    state_path: &Path,
+    devices: &[Device],
+    targets: Vec<usize>,
+) -> Result<Vec<usize>> {
     let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
-    let mut marker = fs::OpenOptions::new()
-        .read(true)
+    let boot_id = boot_id.trim();
+    let lock = fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(false)
         .mode(0o600)
-        .open(state_path.join(".last-boot-wake"))?;
-    marker.lock()?;
-    let mut last_boot = String::new();
-    marker.read_to_string(&mut last_boot)?;
-    if last_boot == boot_id {
-        return Ok(false);
+        .open(state_path.join(".last-boot-wake.lock"))?;
+    lock.lock()?;
+    let marker_path = state_path.join(".last-boot-wake");
+    let marker = match fs::read_to_string(&marker_path) {
+        Ok(marker) => marker,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let mut lines = marker.lines();
+    // A legacy marker has only the boot ID, so its attempted devices are unknown.
+    let mut attempted = BTreeSet::new();
+    if lines.next() == Some(boot_id) {
+        attempted.extend(lines.map(str::to_owned));
     }
-    marker.rewind()?;
-    marker.write_all(boot_id.as_bytes())?;
-    marker.set_len(boot_id.len() as u64)?;
-    marker.sync_all()?;
-    Ok(true)
+    let claimed: Vec<_> = targets
+        .into_iter()
+        .filter(|&index| attempted.insert(devices[index].id.to_ascii_lowercase()))
+        .collect();
+    if !claimed.is_empty() {
+        let mut marker = tempfile::NamedTempFile::new_in(state_path)?;
+        writeln!(marker, "{boot_id}")?;
+        for id in attempted {
+            writeln!(marker, "{id}")?;
+        }
+        marker.as_file().sync_all()?;
+        marker.persist(marker_path)?;
+        fs::File::open(state_path)?.sync_all()?;
+    }
+    Ok(claimed)
 }
 
-async fn wake(daemon: &Arc<Daemon>, trigger: WakeTrigger) {
+async fn wake(daemon: &Arc<Daemon>, trigger: WakeTrigger, targets: impl Iterator<Item = usize>) {
     let deadline = tokio::time::Instant::now() + JOB_TIMEOUT;
-    futures_util::future::join_all(trigger.targets(daemon).map(|index| async move {
+    futures_util::future::join_all(targets.map(|index| async move {
         let id = &daemon.config.devices[index].id;
         let reason = trigger.description();
         eprintln!("{id}: waking TV after {reason}");
@@ -376,6 +410,14 @@ struct PowerState {
 }
 
 impl PowerState {
+    fn reset_for_owner_change(&mut self, daemon: &Daemon) {
+        if self.in_progress() {
+            daemon.reset_tv_connections();
+            daemon.host_transition(false, false);
+        }
+        *self = Self::default();
+    }
+
     fn in_progress(&self) -> bool {
         self.sleeping == Some(true) || self.shutting_down == Some(true)
     }

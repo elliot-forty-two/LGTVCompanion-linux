@@ -14,7 +14,7 @@ use crate::{
     tv::{ExchangeError, Result, Tv},
 };
 
-use super::{failed, run_action, ssap_output, tv_power, wake};
+use super::{ActionProgress, failed, run_action, ssap_output, tv_power, wake};
 
 const KEEPALIVE: Duration = Duration::from_secs(60);
 const POWER_STATE: &str = "com.webos.service.tvpower/power/getPowerState";
@@ -62,7 +62,7 @@ impl Connection {
         store: &Store,
         action: &Action,
         wake_seconds: u64,
-        mut capture: impl FnMut(TvPower, bool) + Send,
+        mut progress: impl FnMut(ActionProgress) + Send,
     ) -> Result<Value> {
         // Checkout before awaiting. Cancelling an in-flight exchange drops the
         // socket and prevents its late reply from leaking into the next job.
@@ -97,7 +97,7 @@ impl Connection {
             device,
             credentials.certificate.as_deref(),
             action,
-            &mut capture,
+            &mut progress,
         )
         .await;
         let result = match result {
@@ -114,7 +114,7 @@ impl Connection {
                         device,
                         credentials.certificate.as_deref(),
                         action,
-                        &mut capture,
+                        &mut progress,
                     )
                     .await?
                 } else if let Some((expected, on_confirm)) = requested_power(action, &exchange.uri)
@@ -130,7 +130,10 @@ impl Connection {
                     {
                         if matches!(action, Action::StreamPowerOff) {
                             // The first observation was captured before the write.
-                            capture(TvPower::Unknown, true);
+                            progress(ActionProgress::StreamPower {
+                                before: TvPower::Unknown,
+                                confirmed_off: true,
+                            });
                         }
                         if expected != TvPower::Standby {
                             self.save(fresh, credentials);
@@ -323,7 +326,7 @@ mod tests {
         };
         let client = async {
             let result = connection
-                .execute(&device, &store, &action, 5, |_, _| {})
+                .execute(&device, &store, &action, 5, |_| {})
                 .await
                 .unwrap();
             assert_eq!(result["payload"]["volume"], 5);

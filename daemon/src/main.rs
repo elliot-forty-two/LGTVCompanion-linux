@@ -18,7 +18,7 @@ use std::{
 use lgtv_companion_runtime::{
     batch::{self, Action, Step},
     config::Config,
-    control::{Connection, default_state_dir, failed},
+    control::{ActionProgress, Connection, default_state_dir, failed},
     ipc::{self, Reply, Request, Response},
     pairing::Store,
     tv::Result,
@@ -250,9 +250,14 @@ impl Daemon {
                         _ = sleep_until(deadline) => {
                             let _ = response.send(json!({"error": "TV command timed out"}));
                         }
-                        result = connection.execute(device, &store, &action, config.wake_timeout_seconds, |before, confirmed| {
-                            if let Some(capture) = &capture {
-                                capture.report(before, confirmed);
+                        result = connection.execute(device, &store, &action, config.wake_timeout_seconds, |progress| {
+                            match progress {
+                                ActionProgress::IdleBlanked(blanked) => idle_blanked = blanked,
+                                ActionProgress::StreamPower { before, confirmed_off } => {
+                                    if let Some(capture) = &capture {
+                                        capture.report(before, confirmed_off);
+                                    }
+                                }
                             }
                         }) => {
                             let output = match result {
@@ -643,6 +648,7 @@ fn update_blank_ownership(owned: &mut bool, action: &Action, value: &Value) {
         return;
     }
     match action {
+        // Covers a lost blanking reply when reconnection confirmed the panel state.
         Action::IdleBlank if value["applied"] == true => *owned = true,
         Action::Wake | Action::IdleRestore => *owned = false,
         Action::HostPowerOff | Action::StreamPowerOff if value["applied"] == true => *owned = false,

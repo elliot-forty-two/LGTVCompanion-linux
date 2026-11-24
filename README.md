@@ -51,7 +51,7 @@ lgtvcli --config devices.json --scan-devices replace
 
 - `refresh` proposes only IP address changes for unambiguous normalized MAC matches. It preserves IDs, certificate paths, automation policies, and pairing state.
 - `append` also proposes new TV records. New records have MAC-derived IDs, default to WSS, and need their own verified certificate and pairing.
-- `replace` stages removal of undiscovered TVs after a usable, complete scan. A failed, incomplete, or empty scan keeps the existing device list. Review the removals carefully when scanning selected interfaces or when some TVs are asleep.
+- `replace` stages removal of undiscovered TVs after a usable, complete scan. A failed, incomplete, or empty scan keeps the existing device list. A responder whose device description fails to load also makes the scan incomplete unless another description confirms that TV. Review the removals carefully when scanning selected interfaces or when some TVs are asleep.
 
 Scans print JSON. They leave configuration files, certificates and pairing keys untouched. For a configuration scan, the proposed configuration is in `plan.preview`. Inspect `plan.changes`, `plan.added`, `plan.removed` and both sets of warnings before applying it. Save the preview in the original configuration directory to keep relative paths valid. Restart the daemon after replacing its configuration.
 
@@ -161,7 +161,7 @@ Restart the service after editing `/etc/lgtv-companion/devices.json`. If at leas
 
 ### Automatic TV wake from the daemon
 
-Set `"wake_on_resume": true` in the TV's `host_power` object to wake it when logind reports the end of sleep preparation. This includes unattended resumes. Set `"wake_on_boot": true` to attempt a wake the first time the daemon starts with that option enabled in a given host boot. The daemon tracks the boot in its state directory to avoid repeating the attempt on service restarts.
+Set `"wake_on_resume": true` in the TV's `host_power` object to wake it when logind reports the end of sleep preparation. This includes unattended resumes. Set `"wake_on_boot": true` to attempt a wake the first time the daemon starts with that option enabled for the TV in a given host boot. The daemon records the attempt by device ID in its state directory so service restarts can wake newly enabled TVs without repeating earlier attempts.
 
 ```json
 "host_power": {

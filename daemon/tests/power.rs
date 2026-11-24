@@ -51,7 +51,11 @@ async fn power_monitor_observes_logind_without_using_the_host_bus() {
 
     let temp = tempfile::tempdir().unwrap();
     let config = temp.path().join("devices.json");
-    fs::write(&config, r#"{"external_api":true,"devices":[]}"#).unwrap();
+    fs::write(
+        &config,
+        r#"{"external_api":true,"streaming":{"mode":"blank"},"devices":[]}"#,
+    )
+    .unwrap();
     let socket = temp.path().join("run/command.sock");
     let (_daemon, mut logs) = start_daemon(temp.path(), &address);
     timeout(WAIT, async {
@@ -137,9 +141,30 @@ async fn power_monitor_observes_logind_without_using_the_host_bus() {
         expect_event(&mut events, event).await;
     }
 
+    let stream_report = || {
+        report_session_method(
+            &socket,
+            Method::ReportStream {
+                source: "test".into(),
+                session: "client".into(),
+                connected: true,
+            },
+        )
+    };
+    assert!(
+        matches!(stream_report().await, Reply::Error { message } if message.contains("transition in progress"))
+    );
+
     // A replacement logind instance must start with fresh transition state.
     assert!(mock.release_name(NAME).await.unwrap());
     unrelated.request_name(NAME).await.unwrap();
+    timeout(WAIT, async {
+        while !matches!(stream_report().await, Reply::Complete) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
     unrelated
         .emit_signal(
             None::<&str>,
@@ -570,6 +595,21 @@ async fn host_resume_wakes_the_tv_without_a_session_agent() {
 
     sleep_signal(&mock, false).await;
     sleep_signal(&mock, false).await;
+    // TCP can come up before webOS finishes bringing up the WebSocket service.
+    let (tcp, _) = timeout(WAIT, tv.accept()).await.unwrap().unwrap();
+    timeout(WAIT, async {
+        let mut tcp = BufReader::new(tcp);
+        let mut headers = String::new();
+        while tcp.read_line(&mut headers).await.unwrap() > 0 {
+            if headers.ends_with("\r\n\r\n") {
+                assert!(headers.starts_with("GET / HTTP/1.1"));
+                return;
+            }
+        }
+        panic!("WebSocket request ended before the headers were complete");
+    })
+    .await
+    .unwrap();
     let mut wake = accept_tv(&tv).await;
     answer(
         &mut wake,
@@ -586,7 +626,7 @@ async fn host_resume_wakes_the_tv_without_a_session_agent() {
 }
 
 #[tokio::test]
-async fn boot_wake_is_attempted_once_across_daemon_restarts() {
+async fn boot_wake_is_attempted_once_per_tv_across_daemon_restarts() {
     let (_bus, address) = start_bus().await;
     let (inhibitors, mut locks) = mpsc::unbounded_channel();
     let _mock = Builder::address(address.as_str())
@@ -600,24 +640,25 @@ async fn boot_wake_is_attempted_once_across_daemon_restarts() {
         .unwrap();
 
     let tv = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let other_tv = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    fs::write(
-        dir.join("devices.json"),
-        json!({
-            "devices": [{"id": "Device1", "ip": "127.0.0.1",
-                "port": tv.local_addr().unwrap().port(), "transport": "ws",
-                "host_power": {"wake_on_boot": true}}]
-        })
-        .to_string(),
-    )
-    .unwrap();
+    let configure = |wake_other| {
+        let config = json!({"devices": [
+            {"id": "Device1", "ip": "127.0.0.1", "port": tv.local_addr().unwrap().port(),
+                "transport": "ws", "host_power": {"wake_on_boot": true}},
+            {"id": "Device2", "ip": "127.0.0.1", "port": other_tv.local_addr().unwrap().port(),
+                "transport": "ws", "host_power": {"wake_on_boot": wake_other}}
+        ]});
+        fs::write(dir.join("devices.json"), config.to_string()).unwrap();
+    };
+    configure(false);
     let state = dir.join("pairing");
-    Store::open(state.clone())
-        .unwrap()
-        .save("Device1", "mock-key")
-        .unwrap();
-    fs::write(state.join(".last-boot-wake"), "previous boot").unwrap();
+    let store = Store::open(state.clone()).unwrap();
+    store.save("Device1", "mock-key").unwrap();
+    store.save("Device2", "mock-key").unwrap();
+    let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+    fs::write(state.join(".last-boot-wake"), boot_id).unwrap();
 
     let (mut daemon, mut logs) = start_daemon(dir, &address);
     let lock = armed(&mut locks, &mut logs).await;
@@ -631,12 +672,35 @@ async fn boot_wake_is_attempted_once_across_daemon_restarts() {
     daemon.kill().await.unwrap();
     released(lock).await;
 
-    let (_daemon, mut logs) = start_daemon(dir, &address);
-    let _lock = armed(&mut locks, &mut logs).await;
+    configure(true);
+    let (mut daemon, mut logs) = start_daemon(dir, &address);
+    let lock = armed(&mut locks, &mut logs).await;
+    let mut wake = accept_tv(&other_tv).await;
+    answer(
+        &mut wake,
+        "ssap://com.webos.service.tvpower/power/getPowerState",
+        json!({"state": "Active"}),
+    )
+    .await;
     assert!(
         timeout(Duration::from_millis(70), tv.accept())
             .await
             .is_err()
+    );
+    daemon.kill().await.unwrap();
+    released(lock).await;
+
+    let (_daemon, mut logs) = start_daemon(dir, &address);
+    let _lock = armed(&mut locks, &mut logs).await;
+    assert!(
+        timeout(Duration::from_millis(70), async {
+            tokio::select! {
+                _ = tv.accept() => {},
+                _ = other_tv.accept() => {},
+            }
+        })
+        .await
+        .is_err()
     );
 }
 
@@ -1303,7 +1367,7 @@ async fn wayland_session_blanks_restores_and_targets_the_mapped_output() {
         "idle_blank_minutes":1,
         "devices":[
             {"id":"Device1","ip":"127.0.0.1","port":first_tv.local_addr().unwrap().port(),"transport":"ws",
-                "host_power":{"output":"DP-1","hdmi_input":1,"follow_display_power":true,"blank_when_idle":true}},
+                "host_power":{"output":"DP-1","hdmi_input":1,"follow_display_power":true,"blank_when_idle":true,"mute_speakers":true}},
             {"id":"Device2","ip":"127.0.0.1","port":second_tv.local_addr().unwrap().port(),"transport":"ws",
                 "host_power":{"output":"HDMI-A-1","follow_display_power":true}}
         ]
@@ -1373,6 +1437,12 @@ async fn wayland_session_blanks_restores_and_targets_the_mapped_output() {
     ))
     .await
     .unwrap();
+    answer(
+        &mut tv,
+        "ssap://audio/setMute",
+        json!({"returnValue":false}),
+    )
+    .await;
 
     let mut tv = accept_tv(&first_tv).await;
     answer(
@@ -1393,6 +1463,7 @@ async fn wayland_session_blanks_restores_and_targets_the_mapped_output() {
         json!({"returnValue":true}),
     )
     .await;
+    answer(&mut tv, "ssap://audio/setMute", json!({"returnValue":true})).await;
     timeout(WAIT, async {
         loop {
             let line = logs.next_line().await.unwrap().expect("daemon exited");

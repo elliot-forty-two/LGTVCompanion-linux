@@ -89,12 +89,10 @@ pub async fn scan(selected: &[String]) -> Result<Discovery> {
     let mut completed = false;
     for (interface, result) in results {
         match result {
-            Ok((found, limited)) => {
+            Ok((found, scan_warnings)) => {
                 completed = true;
-                if limited {
-                    warnings.push(format!("{}: SSDP candidate limit reached", interface.name));
-                }
                 televisions.extend(found);
+                warnings.extend(scan_warnings);
             }
             Err(error) => warnings.push(format!(
                 "{} ({}): {error}",
@@ -130,7 +128,7 @@ async fn scan_interface(
     interface: &Interface,
     target: SocketAddrV4,
     window: Duration,
-) -> Result<(Vec<Television>, bool)> {
+) -> Result<(Vec<Television>, Vec<String>)> {
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     socket.bind(&SocketAddrV4::new(interface.source_ip, 0).into())?;
     socket.set_multicast_if_v4(&interface.source_ip)?;
@@ -174,9 +172,12 @@ async fn scan_interface(
             candidates.insert(url, ip);
         }
     }
-    let limited = candidates.len() == MAX_CANDIDATES;
+    let mut warnings = Vec::new();
+    if candidates.len() == MAX_CANDIDATES {
+        warnings.push(format!("{}: SSDP candidate limit reached", interface.name));
+    }
     if candidates.is_empty() {
-        return Ok((Vec::new(), limited));
+        return Ok((Vec::new(), warnings));
     }
 
     let http = Client::builder()
@@ -185,31 +186,49 @@ async fn scan_interface(
         .local_address(IpAddr::V4(interface.source_ip))
         .timeout(IO_TIMEOUT)
         .build()?;
-    let mut found = stream::iter(candidates)
+    let mut responses = stream::iter(candidates)
         .map(|(url, ip)| {
             let http = &http;
-            async move {
-                let description = fetch_description(http, url).await?;
-                Some(Television {
-                    ip,
-                    interface: interface.clone(),
-                    mac: None,
-                    name: description.name,
-                    model: description.model,
-                    udn: description.udn,
-                })
-            }
+            async move { (ip, fetch_description(http, url).await) }
         })
-        .buffer_unordered(8)
-        .filter_map(std::future::ready)
-        .collect::<Vec<_>>()
-        .await;
+        .buffer_unordered(8);
+    let mut found = Vec::new();
+    let mut failures = BTreeMap::new();
+    while let Some((ip, result)) = responses.next().await {
+        match result {
+            Ok(Some(description)) => found.push(Television {
+                ip,
+                interface: interface.clone(),
+                mac: None,
+                name: description.name,
+                model: description.model,
+                udn: description.udn,
+            }),
+            Ok(None) => {}
+            Err(error) => {
+                failures
+                    .entry(ip)
+                    .or_insert_with(BTreeSet::new)
+                    .insert(error.to_string());
+            }
+        }
+    }
     // A device can advertise multiple services with distinct XML endpoints.
     found.sort_by(|a, b| {
         (a.ip, a.model.is_none(), &a.name).cmp(&(b.ip, b.model.is_none(), &b.name))
     });
     found.dedup_by_key(|tv| tv.ip);
-    Ok((found, limited))
+    for tv in &found {
+        failures.remove(&tv.ip);
+    }
+    for (ip, errors) in failures {
+        let reasons = errors.into_iter().collect::<Vec<_>>().join(", ");
+        warnings.push(format!(
+            "{} ({ip}): could not read SSDP device description: {reasons}",
+            interface.name
+        ));
+    }
+    Ok((found, warnings))
 }
 
 fn usable_ip(address: Ipv4Addr) -> bool {
@@ -255,27 +274,33 @@ struct Description {
     udn: Option<String>,
 }
 
-async fn fetch_description(client: &Client, url: Url) -> Option<Description> {
-    let mut response = client.get(url).send().await.ok()?;
-    if !response.status().is_success()
-        || response
-            .content_length()
-            .is_some_and(|size| size > MAX_XML as u64)
+async fn fetch_description(client: &Client, url: Url) -> Result<Option<Description>> {
+    let mut response = client.get(url).send().await?;
+    if !response.status().is_success() {
+        return Err(format!("HTTP {}", response.status()).into());
+    }
+    if response
+        .content_length()
+        .is_some_and(|size| size > MAX_XML as u64)
     {
-        return None;
+        return Err("Description exceeds the size limit".into());
     }
     let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.ok()? {
+    while let Some(chunk) = response.chunk().await? {
         if bytes.len() + chunk.len() > MAX_XML {
-            return None;
+            return Err("Description exceeds the size limit".into());
         }
         bytes.extend_from_slice(&chunk);
     }
-    parse_description(std::str::from_utf8(&bytes).ok()?)
+    parse_description(std::str::from_utf8(&bytes)?)
 }
 
-fn parse_description(xml: &str) -> Option<Description> {
-    let document = Document::parse(xml).ok()?;
+fn parse_description(xml: &str) -> Result<Option<Description>> {
+    let document = Document::parse(xml)?;
+    Ok(webos_description(&document))
+}
+
+fn webos_description(document: &Document<'_>) -> Option<Description> {
     let root = document.root_element();
     if !root.has_tag_name("root") {
         return None;
@@ -457,21 +482,26 @@ mod tests {
 
     #[test]
     fn accepts_only_lg_webos_metadata_on_the_root_device() {
-        let description = parse_description(LG).unwrap();
+        let description = parse_description(LG).unwrap().unwrap();
         assert_eq!(description.name, "Office TV & HDMI");
         assert_eq!(description.model.as_deref(), Some("OLED65"));
         assert_eq!(description.udn.as_deref(), Some("uuid:example"));
-        assert!(parse_description(&LG.replace("LG Electronics.", "Another vendor")).is_none());
+        assert!(
+            parse_description(&LG.replace("LG Electronics.", "Another vendor"))
+                .unwrap()
+                .is_none()
+        );
         assert!(
             parse_description(
                 &LG.replace("LG webOS TV", "Legacy TV")
                     .replace(WEBOS, "not-webos")
             )
+            .unwrap()
             .is_none()
         );
         let (_, root) = LG.split_once('\n').unwrap();
         let with_dtd = format!("<!DOCTYPE root [<!ENTITY test 'a'>]>{root}");
-        assert!(parse_description(&with_dtd).is_none());
+        assert!(parse_description(&with_dtd).is_err());
     }
 
     #[test]
@@ -535,13 +565,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetches_a_description_over_the_selected_lan_address() {
+    async fn scan_keeps_successful_descriptions_and_reports_fetch_failures() {
         let tcp = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let target = match tcp.local_addr().unwrap() {
             SocketAddr::V4(address) => address,
             SocketAddr::V6(_) => unreachable!(),
         };
         let udp = UdpSocket::bind(target).await.unwrap();
+        let unavailable = TcpListener::bind(("127.0.0.3", 0)).await.unwrap();
+        let unavailable_address = unavailable.local_addr().unwrap();
+        let unavailable_udp = UdpSocket::bind(unavailable_address).await.unwrap();
         let interface = Interface {
             name: "mock".into(),
             source_ip: Ipv4Addr::new(127, 0, 0, 2),
@@ -566,6 +599,13 @@ mod tests {
                 let response =
                     format!("HTTP/1.1 200 OK\r\nLOCATION: http://{target}/description.xml\r\n\r\n");
                 udp.send_to(response.as_bytes(), peer).await.unwrap();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nLOCATION: http://{unavailable_address}/description.xml\r\n\r\n"
+                );
+                unavailable_udp
+                    .send_to(response.as_bytes(), peer)
+                    .await
+                    .unwrap();
             }
             assert_eq!(probes, [WEBOS.to_owned(), RENDERER.to_owned()].into());
             let (socket, peer) = timeout(IO_TIMEOUT, tcp.accept()).await.unwrap().unwrap();
@@ -588,14 +628,32 @@ mod tests {
             );
             socket.write_all(response.as_bytes()).await.unwrap();
         });
+        let failed_responder = tokio::spawn(async move {
+            let (socket, _) = timeout(IO_TIMEOUT, unavailable.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut headers = String::new();
+            while socket.read_line(&mut headers).await.unwrap() > 0 {
+                if headers.ends_with("\r\n\r\n") {
+                    socket.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                    return;
+                }
+            }
+            panic!("Description request ended before the headers were complete");
+        });
 
-        let (found, limited) = scan_interface(&interface, target, Duration::from_millis(250))
+        let (found, warnings) = scan_interface(&interface, target, Duration::from_millis(250))
             .await
             .unwrap();
-        assert!(!limited);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].ip, Ipv4Addr::LOCALHOST);
         assert_eq!(found[0].name, "Office TV & HDMI");
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("127.0.0.3"));
+        assert!(warnings[0].contains("503"));
         responder.await.unwrap();
+        failed_responder.await.unwrap();
     }
 }
